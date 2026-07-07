@@ -55,7 +55,20 @@ def main() -> None:
 def main_web() -> None:
     _configure_logging()
     _check_connectivity()
-    mcp.run(transport="http", host="0.0.0.0", port=int(os.environ.get("MCP_HTTP_PORT", "8080")))
+    # FastMCP's Streamable HTTP transport rejects any Host header not in its allow-list with
+    # 421 Misdirected Request (DNS-rebinding protection). Behind a reverse proxy / on the LAN
+    # the Host is the service's FQDN, not localhost, so allow the homelab domain (overridable).
+    allowed_hosts = [
+        h.strip()
+        for h in os.environ.get("MCP_ALLOWED_HOSTS", "*.strant.casa").split(",")
+        if h.strip()
+    ]
+    mcp.run(
+        transport="http",
+        host="0.0.0.0",
+        port=int(os.environ.get("MCP_HTTP_PORT", "8080")),
+        allowed_hosts=allowed_hosts,
+    )
 
 
 if __name__ == "__main__":
