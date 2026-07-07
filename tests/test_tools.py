@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from caddyui_mcp.client import CaddyUIClient, CaddyUIError, CaddyUISettings
+from caddyui_mcp.client import SERVER_COOKIE, CaddyUIClient, CaddyUIError, CaddyUISettings
 from caddyui_mcp.server import _fmt
 
 # --------------------------------------------------------------------------- unit
@@ -48,7 +48,30 @@ def test_error_carries_status_and_body():
     assert "read-only" in (err.body or "")
 
 
+def test_server_cookie_name():
+    # The multi-server scoping cookie must match CaddyUI's constant.
+    assert SERVER_COOKIE == "caddyui_server"
+
+
 # ---------------------------------------------------------------------------- live
+
+
+@pytest.mark.asyncio
+@pytest.mark.live
+async def test_live_discover_servers(live_settings: tuple[str, str]):
+    """Against a real multi-server CaddyUI: discovery finds at least one server with hosts."""
+    url, token = live_settings
+    client = CaddyUIClient(CaddyUISettings(caddyui_url=url, caddyui_token=token))
+    try:
+        servers = await client.discover_servers(probe_max=24)
+        assert isinstance(servers, list)
+        for s in servers:
+            assert isinstance(s["server_id"], int)
+            assert s["proxy_host_count"] >= 1
+        # This deployment has hosts spread across several servers.
+        assert servers, "expected at least one server with proxy hosts"
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

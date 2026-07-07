@@ -14,6 +14,7 @@ talks to CaddyUI, not to Caddy directly.
 
 | Resource | Tools |
 | --- | --- |
+| **Servers** | `list_caddy_servers` |
 | **Proxy hosts** | `list_proxy_hosts`, `get_proxy_host`, `create_proxy_host`, `update_proxy_host`, `delete_proxy_host`, `toggle_proxy_host`, `set_proxy_host_maintenance` |
 | **Redirection hosts** | `list_redirection_hosts`, `get_redirection_host`, `create_redirection_host`, `update_redirection_host`, `delete_redirection_host`, `toggle_redirection_host` |
 | **Raw routes** | `list_raw_routes`, `get_raw_route`, `create_raw_route`, `update_raw_route`, `delete_raw_route`, `toggle_raw_route` |
@@ -23,6 +24,16 @@ talks to CaddyUI, not to Caddy directly.
 Create/update tools take a JSON `config` object. The proxy-host model has 200+ optional
 fields, so the intended workflow is **`get_*` an existing object, then modify and re-send** —
 the server's instructions tell the LLM to do exactly that.
+
+### Multi-server
+
+CaddyUI can centrally manage **several Caddy instances**, and every resource is scoped to one
+server. Almost every tool takes an optional **`server_id`**; omitting it targets CaddyUI's
+**default server (1)**, which may be empty even when other servers are full. Call
+**`list_caddy_servers`** first — it probes the server ids and reports which hold proxy hosts
+(with sample domains so you can tell them apart) — then pass the chosen `server_id` to the
+other tools. (Server selection uses CaddyUI's `caddyui_server` cookie; there is no documented
+API parameter for it.)
 
 ## Configuration
 

@@ -1,5 +1,28 @@
 # Decisions & lessons
 
+## 2026-07-07 — Multi-server: `/api/v1` is scoped to the `caddyui_server` cookie
+
+**Context.** CaddyUI can centrally manage several Caddy instances. Every `/api/v1` list/CRUD
+endpoint is scoped to "the current server" (confirmed in the in-app `/api/docs` and in
+`server.go`: `apiV1ListProxyHosts` → `models.ListProxyHosts(DB, currentServerID(r), …)`).
+`currentServerID` reads the **`caddyui_server` cookie** and **defaults to server 1** when
+absent. A tokenized request (no cookie) therefore only ever sees server 1 — which is commonly
+empty — so the MCP looked like it saw "0 hosts" even on a deployment with dozens of hosts
+spread across servers 2, 4, 7, 8, 9, 10, …
+
+**Decision.** Thread an optional `server_id` through every tool/client method, sent as the
+`caddyui_server` cookie (set on the httpx client instance, not per-request — per-request
+`cookies=` is deprecated in httpx). Add a `list_caddy_servers` discovery tool: CaddyUI exposes
+**no JSON endpoint** listing its Caddy servers (only HTML `/servers` pages + a session-only
+`POST /servers/{id}/select`), so discovery **probes** `caddyui_server` ids 1..N and reports
+those holding proxy hosts, with sample domains to identify each. The server `instructions`
+tell the LLM to call `list_caddy_servers` first and not conclude "empty" from server 1 alone.
+
+**Lesson.** When a wrapped API returns suspiciously empty results, check for **implicit
+session/tenant scoping** (cookie/header/selected-context) before assuming the backend is
+broken — here the CaddyUI↔Caddy link was perfectly healthy; the API was just scoped to an
+empty default server.
+
 ## 2026-07-07 — Wrap CaddyUI's `/api/v1` REST API, not the UI or Caddy itself
 
 **Context.** CaddyUI (`X4Applegate/caddyui`, Go + chi + SQLite) exposes three kinds of HTTP
