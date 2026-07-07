@@ -30,12 +30,16 @@ certificates** — plus read-only status tools.
 ## Multi-server (important)
 CaddyUI can centrally manage **several Caddy instances**, and every resource belongs to one
 server. Almost every tool takes an optional **`server_id`**:
-1. Call **`list_caddy_servers`** first to see which servers hold hosts (with sample domains so
-   you can tell them apart).
-2. Pass the relevant **`server_id`** to the other tools.
+1. Call **`list_caddy_servers`** first. It returns each server's **`name`** (e.g. "shockwave",
+   "soundwave"), `admin_url`, and proxy-host count.
+2. **Resolve the server the user named** (e.g. "SHOCKWAVE", "the soundwave box") to its
+   `server_id` from that list, then pass **`server_id`** to the other tools. Match names
+   case-insensitively; `admin_url` and `sample_domains` disambiguate if a name is unclear.
 3. If you omit `server_id`, tools target CaddyUI's **default server (1)** — which may be empty
    even when other servers have many hosts. So when a list looks empty, check
    `list_caddy_servers` before concluding there's nothing there.
+4. Entries with `"orphaned": true` are leftover rows from a deleted Caddy server — don't treat
+   them as live servers.
 
 ## Workflow
 1. `list_caddy_servers` → pick a `server_id`.
@@ -76,15 +80,16 @@ def _fmt(obj: Any) -> str:
 
 @mcp.tool(annotations=_READ)
 async def list_caddy_servers(probe_max: int = 24) -> str:
-    """Discover the Caddy servers CaddyUI manages that hold proxy hosts.
+    """List the Caddy servers CaddyUI manages, with their **names**, admin URLs and host counts.
 
-    CaddyUI has no JSON endpoint listing its servers, so this probes server ids 1..probe_max
-    and reports those with proxy hosts, plus a few sample domains to identify each. Use the
-    returned `server_id` with the other tools. (Servers whose only content is redirects or raw
-    routes won't appear — target them by id directly if you know it.)
+    Use this to resolve a server the user names (e.g. "SHOCKWAVE") to its `server_id`, then pass
+    that `server_id` to the other tools. Each entry has: `server_id`, `name` (from the Caddy
+    admin host, e.g. "shockwave"), `admin_url`, `status`, `proxy_host_count`, `sample_domains`,
+    and `orphaned` (true = leftover rows from a deleted server; ignore those). Server names come
+    from CaddyUI's Servers page; host counts come from probing server ids 1..probe_max.
 
     Args:
-        probe_max: Highest server id to probe (default 24).
+        probe_max: Highest server id to probe for lingering hosts (default 24).
     """
     try:
         servers = await get_client().discover_servers(probe_max=probe_max)

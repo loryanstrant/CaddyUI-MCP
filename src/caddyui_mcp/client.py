@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -27,6 +28,11 @@ from pydantic_settings import BaseSettings
 logger = logging.getLogger(__name__)
 
 SERVER_COOKIE = "caddyui_server"
+
+# Matches a Caddy admin URL like ``http://shockwave.local:2019`` in the Servers page.
+_ADMIN_URL_RE = re.compile(r"https?://[^\s\"'<>]+:\d+")
+_STATUS_RE = re.compile(r"\b(online|offline|unknown|error)\b")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 class CaddyUISettings(BaseSettings):
@@ -121,32 +127,87 @@ class CaddyUIClient:
         except ValueError:
             return resp.text
 
-    # ------------------------------------------------- server discovery (probe)
+    # ------------------------------------------------- server discovery
+
+    async def managed_servers(self) -> dict[int, dict[str, Any]]:
+        """Parse CaddyUI's ``/servers`` page into ``{id: {name, admin_url, status}}``.
+
+        CaddyUI has no JSON endpoint listing its Caddy servers, so this best-effort-parses the
+        HTML admin page (a Bearer token is accepted there). The server ``name`` is derived from
+        the admin URL's hostname (e.g. ``http://shockwave.local:2019`` → ``shockwave``), which
+        is robust; the raw ``admin_url`` is always included. Returns ``{}`` if parsing fails.
+        """
+        try:
+            async with self._http() as client:
+                resp = await client.get("/servers")
+            resp.raise_for_status()
+            html = resp.text
+        except Exception as e:  # discovery must never crash a tool
+            logger.warning("Could not fetch /servers page for names: %s", e)
+            return {}
+
+        out: dict[int, dict[str, Any]] = {}
+        for sid in sorted({int(m) for m in re.findall(r"/servers/(\d+)/edit", html)}):
+            pos = html.find(f"/servers/{sid}/")
+            window = _HTML_TAG_RE.sub(" ", html[max(0, pos - 1400) : pos + 40])
+            admin_url = None
+            matches = _ADMIN_URL_RE.findall(window)
+            if matches:
+                admin_url = matches[-1]  # closest to the server's own links
+            status_m = _STATUS_RE.search(window)
+            name = None
+            if admin_url:
+                host = admin_url.split("//", 1)[-1].split(":", 1)[0]
+                name = host.split(".", 1)[0]  # shockwave.local -> shockwave
+            out[sid] = {
+                "name": name,
+                "admin_url": admin_url,
+                "status": status_m.group(1) if status_m else None,
+            }
+        return out
 
     async def discover_servers(self, probe_max: int = 24) -> list[dict[str, Any]]:
-        """Discover managed Caddy servers by probing ``caddyui_server`` ids 1..probe_max.
+        """Discover the Caddy servers CaddyUI manages, with names and proxy-host counts.
 
-        CaddyUI exposes no JSON endpoint listing its Caddy servers, so we scope
-        ``GET /api/v1/proxy-hosts`` to each id and report those that hold proxy hosts, with a
-        few sample domains (which make each server recognisable). Servers whose only content
-        is redirects/raw-routes won't show here — target them directly by id if you know it.
+        Combines the ``/servers`` page (for id → name/admin_url/status) with a probe of
+        ``GET /api/v1/proxy-hosts`` per id (for host counts + sample domains, since the API is
+        scoped by the ``caddyui_server`` cookie). Reports current servers plus any id that
+        still holds proxy hosts but is no longer a registered server (``orphaned: true`` —
+        leftover rows from a deleted Caddy server).
         """
+        managed = await self.managed_servers()
 
-        async def probe(sid: int) -> dict[str, Any] | None:
+        async def count(sid: int) -> tuple[int, list[Any]]:
             try:
                 hosts = await self.list_proxy_hosts(server_id=sid)
             except CaddyUIError:
-                return None
-            if not isinstance(hosts, list) or not hosts:
-                return None
-            return {
-                "server_id": sid,
-                "proxy_host_count": len(hosts),
-                "sample_domains": [h.get("domains") for h in hosts[:6] if isinstance(h, dict)],
-            }
+                return 0, []
+            if not isinstance(hosts, list):
+                return 0, []
+            return len(hosts), [h.get("domains") for h in hosts[:6] if isinstance(h, dict)]
 
-        results = await asyncio.gather(*(probe(i) for i in range(1, probe_max + 1)))
-        return [r for r in results if r is not None]
+        ids = sorted(set(managed) | set(range(1, probe_max + 1)))
+        counts = dict(zip(ids, await asyncio.gather(*(count(i) for i in ids)), strict=True))
+
+        servers: list[dict[str, Any]] = []
+        for sid in ids:
+            n, domains = counts[sid]
+            is_managed = sid in managed
+            if not is_managed and n == 0:
+                continue  # neither a registered server nor holding any hosts
+            info = managed.get(sid, {})
+            servers.append(
+                {
+                    "server_id": sid,
+                    "name": info.get("name"),
+                    "admin_url": info.get("admin_url"),
+                    "status": info.get("status"),
+                    "orphaned": not is_managed,
+                    "proxy_host_count": n,
+                    "sample_domains": domains,
+                }
+            )
+        return servers
 
     # --------------------------------------------------------------- proxy hosts
 
