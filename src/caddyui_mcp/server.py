@@ -30,8 +30,8 @@ certificates** — plus read-only status tools.
 ## Multi-server (important)
 CaddyUI can centrally manage **several Caddy instances**, and every resource belongs to one
 server. Almost every tool takes an optional **`server_id`**:
-1. Call **`list_caddy_servers`** first. It returns each server's **`name`** (e.g. "shockwave",
-   "soundwave"), `admin_url`, and proxy-host count.
+1. Call **`list_caddy_servers`** first. It returns each server's **`name`** — CaddyUI's own
+   server label (e.g. "SHOCKWAVE", "SOUNDWAVE") — plus `admin_url`, `status`, and host count.
 2. **Resolve the server the user named** (e.g. "SHOCKWAVE", "the soundwave box") to its
    `server_id` from that list, then pass **`server_id`** to the other tools. Match names
    case-insensitively; `admin_url` and `sample_domains` disambiguate if a name is unclear.
@@ -83,9 +83,9 @@ async def list_caddy_servers(probe_max: int = 24) -> str:
     """List the Caddy servers CaddyUI manages, with their **names**, admin URLs and host counts.
 
     Use this to resolve a server the user names (e.g. "SHOCKWAVE") to its `server_id`, then pass
-    that `server_id` to the other tools. Each entry has: `server_id`, `name` (from the Caddy
-    admin host, e.g. "shockwave"), `admin_url`, `status`, `proxy_host_count`, `sample_domains`,
-    and `orphaned` (true = leftover rows from a deleted server; ignore those). Server names come
+    that `server_id` to the other tools. Each entry has: `server_id`, `name` (CaddyUI's own
+    server label, e.g. "SHOCKWAVE"), `admin_url`, `status`, `proxy_host_count`, `sample_domains`,
+    and `orphaned` (true = leftover rows from a deleted server; ignore those). Server labels come
     from CaddyUI's Servers page; host counts come from probing server ids 1..probe_max.
 
     Args:

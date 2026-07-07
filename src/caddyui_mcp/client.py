@@ -133,9 +133,9 @@ class CaddyUIClient:
         """Parse CaddyUI's ``/servers`` page into ``{id: {name, admin_url, status}}``.
 
         CaddyUI has no JSON endpoint listing its Caddy servers, so this best-effort-parses the
-        HTML admin page (a Bearer token is accepted there). The server ``name`` is derived from
-        the admin URL's hostname (e.g. ``http://shockwave.local:2019`` → ``shockwave``), which
-        is robust; the raw ``admin_url`` is always included. Returns ``{}`` if parsing fails.
+        HTML admin page (a Bearer token is accepted there). Each server is a table row whose
+        cells are ``[name, status, admin_url, …]``; ``name`` is CaddyUI's own server label
+        (falling back to the admin host if a label is blank). Returns ``{}`` if parsing fails.
         """
         try:
             async with self._http() as client:
@@ -146,23 +146,27 @@ class CaddyUIClient:
             logger.warning("Could not fetch /servers page for names: %s", e)
             return {}
 
+        def cell_text(cell: str) -> str | None:
+            return _HTML_TAG_RE.sub(" ", cell).strip() or None
+
         out: dict[int, dict[str, Any]] = {}
-        for sid in sorted({int(m) for m in re.findall(r"/servers/(\d+)/edit", html)}):
-            pos = html.find(f"/servers/{sid}/")
-            window = _HTML_TAG_RE.sub(" ", html[max(0, pos - 1400) : pos + 40])
-            admin_url = None
-            matches = _ADMIN_URL_RE.findall(window)
-            if matches:
-                admin_url = matches[-1]  # closest to the server's own links
-            status_m = _STATUS_RE.search(window)
-            name = None
-            if admin_url:
-                host = admin_url.split("//", 1)[-1].split(":", 1)[0]
-                name = host.split(".", 1)[0]  # shockwave.local -> shockwave
+        for row in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S):
+            m = re.search(r"/servers/(\d+)/(?:select|edit|config)", row)
+            if not m:
+                continue
+            sid = int(m.group(1))
+            cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)
+            name = cell_text(cells[0]) if cells else None
+            status = cell_text(cells[1]) if len(cells) > 1 else None
+            admin_m = _ADMIN_URL_RE.search(row)
+            admin_url = admin_m.group(0) if admin_m else None
+            if not name and admin_url:  # fallback: derive from admin host
+                name = admin_url.split("//", 1)[-1].split(":", 1)[0].split(".", 1)[0]
+            status_m = _STATUS_RE.search(status or "")
             out[sid] = {
                 "name": name,
                 "admin_url": admin_url,
-                "status": status_m.group(1) if status_m else None,
+                "status": status_m.group(1) if status_m else status,
             }
         return out
 
