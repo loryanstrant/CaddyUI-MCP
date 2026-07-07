@@ -1,0 +1,51 @@
+[project]
+name = "caddyui-mcp"
+dynamic = ["version"]
+description = "MCP server for CaddyUI — manage a Caddy reverse proxy (proxy/redirection hosts, raw routes, certificates) over its /api/v1 REST API"
+license = "MIT"
+requires-python = ">=3.13"
+authors = [{ name = "loryanstrant", email = "loryan@loryanstrant.com" }]
+dependencies = [
+    "fastmcp>=2.0.0",
+    "httpx>=0.27.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://gitea.strant.casa/loryanstrant/CaddyUI-MCP"
+"CaddyUI (upstream app)" = "https://github.com/X4Applegate/caddyui"
+
+[project.scripts]
+caddyui-mcp = "caddyui_mcp.__main__:main"
+caddyui-mcp-web = "caddyui_mcp.__main__:main_web"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.0",
+    "ty>=0.0.20",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "TCH", "RUF"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "live: tests that require a real CaddyUI instance (set CADDYUI_URL and CADDYUI_TOKEN)",
+]
+
+[tool.ty.environment]
+python-version = "3.13"
