@@ -1,0 +1,62 @@
+[
+    {
+        "admin_url": "http://blaster.strant.casa:2019",
+        "id": 4,
+        "last_contact_at": "2026-07-30T20:52:01.426382393Z",
+        "name": "BLASTER",
+        "status": "online",
+        "tags": [],
+        "type": "managed",
+        "version": ""
+    },
+    {
+        "admin_url": "http://metroplex.strant.casa:2019",
+        "id": 8,
+        "last_contact_at": "2026-07-30T20:52:01.42999391Z",
+        "name": "METROPLEX",
+        "status": "online",
+        "tags": [],
+        "type": "managed",
+        "version": ""
+    },
+    {
+        "admin_url": "http://shockwave.strant.casa:2019",
+        "id": 9,
+        "last_contact_at": "2026-07-30T20:52:01.432475517Z",
+        "name": "SHOCKWAVE",
+        "status": "online",
+        "tags": [],
+        "type": "managed",
+        "version": ""
+    },
+    {
+        "admin_url": "http://soundwave.strant.casa:2019",
+        "id": 10,
+        "last_contact_at": "2026-07-30T20:52:01.435308257Z",
+        "name": "SOUNDWAVE",
+        "status": "online",
+        "tags": [],
+        "type": "managed",
+        "version": ""
+    },
+    {
+        "admin_url": "http://teletraan-i.strant.casa:2019",
+        "id": 11,
+        "last_contact_at": "2026-07-30T20:52:01.438004902Z",
+        "name": "TELETRAAN-I",
+        "status": "online",
+        "tags": [],
+        "type": "managed",
+        "version": ""
+    },
+    {
+        "admin_url": "http://trypticon.strant.casa:2019",
+        "id": 12,
+        "last_contact_at": "2026-07-30T20:52:01.439958734Z",
+        "name": "TRYPTICON",
+        "status": "online",
+        "tags": [],
+        "type": "managed",
+        "version": ""
+    }
+]

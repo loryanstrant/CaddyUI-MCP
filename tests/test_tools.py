@@ -6,9 +6,11 @@ import pytest
 
 from caddyui_mcp.client import (
     SERVER_COOKIE,
+    SERVER_FIELDS,
     CaddyUIClient,
     CaddyUIError,
     CaddyUISettings,
+    normalise_api_servers,
     select_unused_certificates,
 )
 from caddyui_mcp.server import _fmt, create_certificate, validate_raw_route
@@ -180,40 +182,66 @@ async def test_live_discover_servers(live_settings: tuple[str, str]):
     try:
         servers = await client.discover_servers(probe_max=24)
         assert isinstance(servers, list)
+        assert servers, "expected at least one server with proxy hosts"
         for s in servers:
             assert isinstance(s["server_id"], int)
             assert s["proxy_host_count"] >= 1
-            # New keys must always be present, even if a partial parse leaves them null.
-            for key in ("policy", "caddy_version", "last_contact"):
-                assert key in s
-        # This deployment has hosts spread across several servers.
-        assert servers, "expected at least one server with proxy hosts"
+            assert set(s) == {
+                "server_id",
+                *SERVER_FIELDS,
+                "orphaned",
+                "proxy_host_count",
+                "sample_domains",
+            }
+        # Every *registered* server must have resolved a name — the contract the whole tool
+        # exists for, and the assertion that would have caught the old admin-gating failure.
+        assert all(s["name"] for s in servers if s["orphaned"] is False)
     finally:
         await client.close()
 
 
 @pytest.mark.asyncio
 @pytest.mark.live
-async def test_live_servers_page_parses(live_settings: tuple[str, str]):
-    """The regression guard: scraped names must stay clean whatever CaddyUI's template does.
+async def test_live_servers_endpoint_shape(live_settings: tuple[str, str]):
+    """`GET /api/v1/servers` (CaddyUI 2.20.2+, upstream issue #18) returns what we expect."""
+    url, token = live_settings
+    client = CaddyUIClient(CaddyUISettings(caddyui_url=url, caddyui_token=token))
+    try:
+        raw = await client.servers()
+        assert isinstance(raw, list) and raw
+        for s in raw:
+            assert isinstance(s["id"], int)
+            assert s["name"]
+            assert s["status"] == s["status"].lower()
+            assert s["type"] in {"managed", "external"}
+            assert isinstance(s["tags"], list)
+            assert "last_contact_at" in s
+    finally:
+        await client.close()
 
-    This is markup-generation agnostic on purpose — it would have caught the v2.20 "Caddy
-    Fleet" rewrite gluing badges onto the name, and it passes on both v2.16 and v2.20.
+
+@pytest.mark.asyncio
+@pytest.mark.live
+async def test_live_sources_agree(live_settings: tuple[str, str]):
+    """The JSON endpoint and the deprecated scraper must describe the same fleet identically.
+
+    This validates the normalisation contract against reality rather than against fixtures.
+    It is also the **deletion trigger**: once this has passed for months, the scraper has
+    demonstrably stopped adding information, and it goes — along with this test.
     """
     url, token = live_settings
     client = CaddyUIClient(CaddyUISettings(caddyui_url=url, caddyui_token=token))
     try:
-        servers = await client.managed_servers()
-        assert servers, "expected at least one registered Caddy server"
-        for sid, s in servers.items():
-            assert isinstance(sid, int)
-            name = s["name"]
-            assert name, f"server {sid} has no name"
-            assert "\n" not in name, f"server {sid} name has bled: {name!r}"
-            assert "Current" not in name, f"server {sid} name absorbed a badge: {name!r}"
-            assert len(name) <= 64, f"server {sid} name looks like a whole cell: {name!r}"
-            assert s["status"] in {"online", "offline", "unknown", "error", None}
-            assert s["policy"] in {"managed", "external", None}
+        api = normalise_api_servers(await client.servers())
+        html = await client._scrape_servers()
+        assert api, "expected the JSON endpoint to return servers"
+        if html is None:
+            pytest.skip("/servers page not readable (needs an admin-scoped token)")
+        assert set(api) == set(html), "the two sources disagree on which servers exist"
+        shared = ("name", "admin_url", "status", "type")
+        for sid in api:
+            for key in shared:
+                assert api[sid][key] == html[sid][key], f"server {sid} disagrees on {key}"
     finally:
         await client.close()
 

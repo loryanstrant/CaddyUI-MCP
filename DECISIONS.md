@@ -1,13 +1,69 @@
 # Decisions & lessons
 
+## 2026-07-31 — Filing the upstream issue beat hardening the scraper
+
+**Context.** On 2026-07-30 this repo did two things in the same session: hardened the `/servers`
+HTML parser against CaddyUI v2.20.0's "Caddy Fleet" rewrite (the entry below), and filed two
+upstream issues. **The maintainer implemented both within about three hours.** CaddyUI v2.20.2
+shipped `GET /api/v1/servers` — inside `requireAuth` rather than admin-gated, unlike the HTML page
+it replaces, so it works with a `read_only` token — returning the whole fleet as a flat array with
+`id`, `name`, `admin_url`, `type`, `status`, `version`, `tags`, `last_contact_at`. The ~150-line
+parser was obsolete within a day of shipping.
+
+**Decision.** Prefer the endpoint; keep the parser as a fallback triggered **only** by a 404,
+quarantined in `_servers_html.py` and marked deprecated. A 401/403/5xx returns "couldn't
+determine" instead of falling back — an auth or scope failure is not an old CaddyUI, and scraping
+would mask it. **Removal horizon: delete `_servers_html.py`, `tests/test_servers_html.py` and the
+four `tests/fixtures/servers_*.html` files in the first release on or after 2026-11-01**, unless
+someone has reported the fallback warning firing in the wild. Absence of a report is a reason to
+delete, not to defer.
+
+**Naming rule** (settled here so the next field takes ten seconds): use the *tool parameter's*
+name if the field is also a parameter (`server_id`, not upstream's `id`); otherwise use
+**upstream's** name (`type`, `tags`, `status`, `last_contact_at`); rename only when upstream's
+name is ambiguous *inside our own output* — which is why `version` becomes `caddy_version`, since
+this server also exposes `caddy_version` and `caddyui_version` tools.
+
+**Rejected: version-gating.** Branching on `caddyui_version()["current"] >= 2.20.2` would add a
+round-trip to every call, break on dev builds and `unknown`, and version-string comparison is its
+own bug farm. Try-the-endpoint-and-catch-404 is cheaper, self-correcting, and has no failure mode
+of its own.
+
+**Lessons (reusable).**
+- **When you're forced to scrape, file the upstream issue in the same session as the workaround.**
+  They aren't alternatives and you don't have to choose: the workaround unblocks today, the issue
+  removes the whole class of problem — and the issue is the *cheaper* of the two to write.
+  Anchoring on "how do I scrape this well" instead of "why is there no endpoint" is the failure
+  mode.
+- **Evidence earns the turnaround, not the request.** Ours named the model that already held the
+  data (`models.ListCaddyServers`, consumed only by HTML handlers), the exact handlers, the
+  response shape we wanted, and why. That converts "please add an API" into a diff someone can
+  write in one sitting. The same handler-reading that makes a *good scraper* makes a *fundable
+  issue* — do it once, spend it twice.
+- **A workaround's success metric is how soon it can be deleted.** Give it a removal date and a
+  log line that fires when it runs, so obsolescence is *observed* rather than assumed.
+- **Propose the field names too.** The endpoint shipped with upstream's vocabulary while ours had
+  already diverged (`policy`, `last_contact`), so day one of the new endpoint was spent
+  reconciling names. One paragraph in the issue would have avoided it.
+- **`{}` and "I don't know" are not the same value.** Discovery returned `{}` both when there were
+  no servers and when the listing failed, so a failed listing marked every server `orphaned: true`
+  — and the tool instructions tell the model to ignore orphaned entries, making a working fleet
+  look empty. Any lookup that can fail *and* legitimately be empty needs three states, not two.
+
 ## 2026-07-30 — Scrape `/servers` semantically, not by ordinal (CaddyUI v2.20 "Caddy Fleet")
+
+> **Status (2026-07-31): superseded.** CaddyUI v2.20.2 added `GET /api/v1/servers` (upstream
+> issue #18, filed the same day as this entry and implemented in ~3 hours). Scraping is now a
+> fallback for CaddyUI < 2.20.2, scheduled for removal — see the entry above. **The parsing
+> lessons below still stand; the framing does not.** This entry reads as "here is how to scrape
+> well"; the more valuable answer turned out to be "here is how to not need to".
 
 **Context.** CaddyUI shipped v2.16.10 → v2.20.1 in a single day. Diffing the route tables
 between the tags showed the **`/api/v1` surface is unchanged** — only three routes were added
 anywhere in the app, none of them versioned. But v2.20.0 rewrote `web/templates/servers.html`,
-the one page this MCP has to scrape because CaddyUI exposes no JSON list of its Caddy servers
-(re-verified: `models.ListCaddyServers` is consumed only by HTML handlers). The name cell went
-from `<div>NAME</div>` to `<div class="fleet-name"><strong>NAME</strong><span>Current</span></div>
+the one page this MCP had to scrape because CaddyUI exposed no JSON list of its Caddy servers
+(true through v2.20.1: `models.ListCaddyServers` was consumed only by HTML handlers; v2.20.2
+added an API consumer). The name cell went from `<div>NAME</div>` to `<div class="fleet-name"><strong>NAME</strong><span>Current</span></div>
 <div class="fleet-tags"><span class="version-pill">…</span>…</div>`, health badges went
 lowercase → capitalised, 7 columns became 6, and the selected row lost its `Select` form.
 
@@ -90,8 +146,10 @@ Two upstream comments in the same file are stale relative to the code: `/api/raw
 no longer uses Caddy's `/load?validate_only=true` (v2.9.233 removed it — Caddy ignores the flag,
 so the "validation" was actually *applying* a ghost server to the running config); it now uses
 `/adapt` for Caddyfile input and a structural `handle`-array check for JSON. Separately,
-`/api/version-check` reports a `latest` derived from Docker Hub tags that can be **older** than
-`current` (observed: `latest: v2.9.233` on a v2.20.1 install), so only `current` is trustworthy.
+`/api/version-check` reported a `latest` derived from Docker Hub tags that could be **older** than
+`current` (observed: `latest: v2.9.233` on a v2.20.1 install), so only `current` was trustworthy.
+**Update (2026-07-31):** fixed upstream in v2.20.2 (issue #17 — the tag query only read page 1).
+`latest` is trustworthy on v2.20.2+.
 
 **Lesson.** **Read the handler before writing the client method.** `r.FormValue` vs
 `json.NewDecoder` changes the signature, and an endpoint's name, its doc comment, and what it now
@@ -114,6 +172,11 @@ spread across servers 2, 4, 7, 8, 9, 10, …
 `POST /servers/{id}/select`), so discovery **probes** `caddyui_server` ids 1..N and reports
 those holding proxy hosts, with sample domains to identify each. The server `instructions`
 tell the LLM to call `list_caddy_servers` first and not conclude "empty" from server 1 alone.
+
+**Update (2026-07-31).** CaddyUI v2.20.2 added `GET /api/v1/servers`, so discovery no longer
+needs the id probe to *find* servers — only to find **orphans** (ids still holding resources
+after their server row was deleted, which the endpoint by definition cannot report). The
+cookie-scoping lesson below is unchanged.
 
 **Lesson.** When a wrapped API returns suspiciously empty results, check for **implicit
 session/tenant scoping** (cookie/header/selected-context) before assuming the backend is

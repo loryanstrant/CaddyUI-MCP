@@ -13,169 +13,71 @@ list/CRUD endpoint is scoped to the "current server", chosen by the ``caddyui_se
 (the UI's server picker POSTs ``/servers/{id}/select``). A tokenized request with no cookie
 defaults to **server 1**. This client sends ``caddyui_server=<server_id>`` when a ``server_id``
 is supplied, so callers can target any managed Caddy server.
+
+The one exception is ``GET /api/v1/servers`` (CaddyUI 2.20.2+, added at this project's request —
+upstream issue #18), which is unscoped and lists the whole fleet. Older instances have no such
+endpoint, so :mod:`caddyui_mcp._servers_html` scrapes the HTML page as a deprecated fallback.
 """
 
 from __future__ import annotations
 
 import asyncio
-import html as html_mod
 import logging
-import re
 from typing import Any
 
 import httpx
 from pydantic_settings import BaseSettings
 
+from caddyui_mcp._servers_html import _detect_markup, parse_servers_html
+
 logger = logging.getLogger(__name__)
 
 SERVER_COOKIE = "caddyui_server"
 
-# --------------------------------------------------------------- /servers scraping
+# ------------------------------------------------------------------ server listing
 #
-# CaddyUI exposes no JSON endpoint listing the Caddy servers it manages (verified against
-# upstream v2.20.1: ``models.ListCaddyServers`` is consumed only by HTML handlers), so the
-# ``/servers`` page has to be scraped. That page has been rewritten once already — v2.20.0
-# replaced the "Caddy Servers" table with the "Caddy Fleet" inventory — so these rules are
-# deliberately **ordinal-free**: they anchor on element role (``<strong>``), stable class
-# names (``version-pill``), whole-segment token equality, and position *relative to a stable
-# anchor* rather than raw column indices. Both generations are pinned by fixtures in
-# ``tests/fixtures/``. See DECISIONS.md (2026-07-30) before changing any of this.
+# CaddyUI 2.20.2+ exposes ``GET /api/v1/servers``; older instances only render the server list
+# as HTML, which :mod:`caddyui_mcp._servers_html` scrapes. Both sources are normalised into one
+# shape so ``discover_servers`` never has to know which one it got.
 
-# Non-content elements whose text must never be mistaken for a field value.
-_NOISE_RE = re.compile(r"<(script|style|svg)\b.*?</\1>", re.S | re.I)
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
-_CELL_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.S | re.I)
-# Every row links to at least one of these, in both generations. The fleet markup drops the
-# ``Select`` form on the currently-selected server, so ``select`` alone is not enough.
-_SERVER_ID_RE = re.compile(r"/servers/(\d+)/(?:select|edit|config|delete)")
-# A Caddy admin endpoint: ``http://host:2019`` or a Unix socket (which the v2.20 page
-# actively recommends, and which has no scheme or port).
-_ADMIN_URL_RE = re.compile(r"(?:https?://[^\s\"'<>]+:\d+|unix/[^\s\"'<>]+)")
-# v2.16 renders these lowercase, v2.20 capitalises them — hence re.I, and callers lower().
-_STATUS_RE = re.compile(r"\b(online|offline|unknown|error)\b", re.I)
-_POLICY_RE = re.compile(r"\A(managed|external)\Z", re.I)
-_STRONG_RE = re.compile(r"<strong[^>]*>(.*?)</strong>", re.S | re.I)
-_VERSION_PILL_RE = re.compile(
-    r"<span[^>]*class=\"[^\"]*version-pill[^\"]*\"[^>]*>(.*?)</span>", re.S | re.I
+#: The keys every server entry carries, whichever source produced it. Asserted by tests against
+#: both paths — if you add a key here, both sources must emit it.
+SERVER_FIELDS = (
+    "name",
+    "admin_url",
+    "status",
+    "type",
+    "caddy_version",
+    "tags",
+    "last_contact_at",
 )
-# Text that sits alongside the name but is not part of it. The escapes are em/en dashes,
-# which CaddyUI uses as the "no value" placeholder in several cells.
-_BADGE_TEXT_RE = re.compile(r"\A(current|no tags|never|managed|external|[-\u2014\u2013])\Z", re.I)
 
 
-def _text_segments(fragment: str) -> list[str]:
-    """Split an HTML fragment into its visible text runs, one per element.
+def normalise_api_servers(payload: Any) -> dict[int, dict[str, Any]]:
+    """Normalise ``GET /api/v1/servers`` into ``{id: {…SERVER_FIELDS}}``.
 
-    Uses ``_HTML_TAG_RE.split`` rather than ``.sub`` on purpose: substituting tags with a
-    space **destroys the element boundaries that carry the meaning**, which is exactly how
-    the v2.20 "Caddy Fleet" rewrite turned a name cell into
-    ``"SHOCKWAVE \\n Current \\n v2.10.0 edge"``. Splitting keeps each element's text
-    separate so the caller can pick the one it wants.
-    """
-    fragment = _NOISE_RE.sub(" ", fragment)
-    return [t for t in (html_mod.unescape(p).strip() for p in _HTML_TAG_RE.split(fragment)) if t]
-
-
-def _detect_markup(html: str) -> str:
-    """Identify which ``/servers`` template generation produced ``html`` (for logging only).
-
-    Deliberately not surfaced in tool output — it is noise for an LLM. It exists so a future
-    third generation shows up as ``markup=unknown`` in the container logs instead of as a
-    silent data-quality regression.
-    """
-    if "fleet-table" in html or "fleet-name" in html:
-        return "fleet"  # v2.20.0+
-    if "md:table" in html or "version-pill" in html:
-        return "classic"  # v2.16.x and earlier
-    return "unknown"
-
-
-def _parse_server_row(row: str) -> tuple[int, dict[str, Any]] | None:
-    """Parse one ``<tr>`` into ``(server_id, {...})``, or ``None`` if it isn't a server row."""
-    id_m = _SERVER_ID_RE.search(row)
-    if id_m is None:
-        return None  # header row, or the colspan empty-state row
-    server_id = int(id_m.group(1))
-
-    cells = _CELL_RE.findall(row)
-    name_cell = cells[0] if cells else ""
-
-    # --- admin_url: searched over the whole row, so column order is irrelevant.
-    admin_m = _ADMIN_URL_RE.search(row)
-    admin_url = admin_m.group(0) if admin_m else None
-
-    # --- caddy_version: the ``version-pill`` class is identical in both generations.
-    version_m = _VERSION_PILL_RE.search(name_cell)
-    caddy_version = None
-    if version_m is not None:
-        segs = _text_segments(version_m.group(1))
-        caddy_version = segs[0] if segs else None
-
-    # --- name: prefer the semantic element, then the first non-badge text run, then the host.
-    name = None
-    strong_m = _STRONG_RE.search(name_cell)
-    if strong_m is not None:  # fleet markup wraps the name in <strong>
-        segs = _text_segments(strong_m.group(1))
-        name = segs[0] if segs else None
-    if not name:
-        # Classic markup has no <strong>. Drop the version pill (it is a sibling of the
-        # name, not part of it) and take the first text run that isn't a status badge.
-        stripped = _VERSION_PILL_RE.sub(" ", name_cell)
-        candidates = [s for s in _text_segments(stripped) if not _BADGE_TEXT_RE.match(s)]
-        name = candidates[0] if candidates else None
-    if not name and admin_url:  # last resort: derive a label from the admin host
-        name = admin_url.split("//", 1)[-1].split(":", 1)[0].split(".", 1)[0]
-
-    # --- status: cell 1 in both generations, but fall back to the row so a reorder degrades
-    # to "still finds it" rather than "returns None".
-    status_source = cells[1] if len(cells) > 1 else row
-    status_m = _STATUS_RE.search(" ".join(_text_segments(status_source))) or _STATUS_RE.search(row)
-    status = status_m.group(1).lower() if status_m is not None else None
-
-    # --- policy: whole-segment token match in any cell other than the name cell and the
-    # actions cell. Token matching (rather than "cell 3") survives a future column reorder;
-    # excluding the name cell stops a server literally *named* "Managed" from poisoning it.
-    policy = None
-    for idx, cell in enumerate(cells):
-        if idx == 0 or _SERVER_ID_RE.search(cell):
-            continue
-        match = next((s for s in _text_segments(cell) if _POLICY_RE.match(s)), None)
-        if match is not None:
-            policy = match.lower()
-            break
-
-    # --- last_contact: the cell immediately before the actions cell. Position relative to a
-    # stable anchor, so one rule covers index 5 (classic, 7 columns) and 4 (fleet, 6).
-    last_contact = None
-    actions_idx = next((i for i, c in enumerate(cells) if _SERVER_ID_RE.search(c)), None)
-    if actions_idx is not None and actions_idx > 0:
-        segs = _text_segments(cells[actions_idx - 1])
-        last_contact = segs[0] if segs else None
-
-    return server_id, {
-        "name": name,
-        "admin_url": admin_url,
-        "status": status,
-        "policy": policy,
-        "caddy_version": caddy_version,
-        "last_contact": last_contact,
-    }
-
-
-def parse_servers_html(html: str) -> dict[int, dict[str, Any]]:
-    """Parse CaddyUI's ``/servers`` page into ``{id: {name, admin_url, status, ...}}``.
-
-    Pure and I/O-free so both markup generations can be pinned by fixtures. Rows that don't
-    link to ``/servers/{id}/…`` (the header, the empty-state row) are skipped, as are the
-    responsive mobile cards — they use ``<article>``/``<div>``, not ``<tr>``, so they never
-    produce duplicate ids.
+    Pure and I/O-free. Tolerates a non-list payload, non-dict entries and a missing or non-int
+    ``id`` — a malformed response degrades to fewer entries, never an exception.
     """
     out: dict[int, dict[str, Any]] = {}
-    for row in _ROW_RE.findall(html):
-        parsed = _parse_server_row(row)
-        if parsed is not None:
-            out[parsed[0]] = parsed[1]
+    for entry in payload if isinstance(payload, list) else []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), int):
+            continue
+        status = entry.get("status")
+        tags = entry.get("tags")
+        out[entry["id"]] = {
+            "name": entry.get("name") or None,
+            "admin_url": entry.get("admin_url") or None,
+            # Already lowercase upstream; normalising anyway makes "status is always lowercase"
+            # true by construction rather than by upstream's continued goodwill.
+            "status": status.lower() if isinstance(status, str) and status else None,
+            "type": entry.get("type") or None,
+            # Upstream sends "" for unknown; None reads as "unknown" to an LLM, "" reads as
+            # "the version is the empty string", and None is what the HTML path emits.
+            "caddy_version": entry.get("version") or None,
+            "tags": tags if isinstance(tags, list) else [],
+            "last_contact_at": entry.get("last_contact_at") or None,
+        }
     return out
 
 
@@ -338,55 +240,95 @@ class CaddyUIClient:
 
     # ------------------------------------------------- server discovery
 
-    async def managed_servers(self) -> dict[int, dict[str, Any]]:
-        """Fetch and parse CaddyUI's ``/servers`` page into ``{id: {name, admin_url, …}}``.
+    async def servers(self) -> Any:
+        """``GET /api/v1/servers`` — every Caddy server CaddyUI manages (CaddyUI 2.20.2+).
 
-        CaddyUI has no JSON endpoint listing its Caddy servers, so this scrapes the HTML admin
-        page (a Bearer token is accepted there). Parsing lives in :func:`parse_servers_html`;
-        this method is only transport plus diagnostics. Returns ``{}`` if the page can't be
-        fetched or parsed — discovery must never crash a tool.
+        Unlike every other ``/api/v1`` endpoint this one is **not** scoped by the
+        ``caddyui_server`` cookie; it returns the whole fleet. It therefore takes no
+        ``server_id`` deliberately — passing one would be a silent no-op.
+        """
+        return await self._request("GET", "/api/v1/servers")
+
+    async def registered_servers(self) -> dict[int, dict[str, Any]] | None:
+        """Registered Caddy servers keyed by id, in the common :data:`SERVER_FIELDS` shape.
+
+        Prefers ``GET /api/v1/servers`` (CaddyUI 2.20.2+, added at this project's request —
+        upstream issue #18). Falls back to scraping the HTML ``/servers`` page **only** on a
+        404, which is what an older CaddyUI returns for a route it doesn't have.
+
+        Returns ``None`` for *could not be determined*, which is deliberately distinct from
+        ``{}`` for *determined, and empty*: the caller uses that difference to avoid claiming
+        every server is orphaned when the listing itself failed.
+        """
+        try:
+            return normalise_api_servers(await self.servers())
+        except CaddyUIError as e:
+            if e.status_code != 404:
+                # A 401/403/5xx is an auth, scope or server problem — not an old CaddyUI.
+                # Scraping instead would mask it (and would fail too, differently).
+                logger.warning("GET /api/v1/servers failed: %s", e)
+                return None
+            logger.warning(
+                "GET /api/v1/servers -> 404; this CaddyUI predates v2.20.2. Falling back to "
+                "scraping the HTML /servers page — deprecated, scheduled for removal (see "
+                "DECISIONS.md 2026-07-31). Upgrade CaddyUI to v2.20.2+."
+            )
+        return await self._scrape_servers()
+
+    async def _scrape_servers(self) -> dict[int, dict[str, Any]] | None:
+        """**Deprecated** fallback: parse the HTML ``/servers`` page (CaddyUI < 2.20.2).
+
+        Transport and diagnostics only; parsing lives in :mod:`caddyui_mcp._servers_html`.
         """
         try:
             async with self._http() as client:
                 resp = await client.get("/servers")
         except Exception as e:  # discovery must never crash a tool
             logger.warning("Could not fetch /servers page for names: %s", e)
-            return {}
+            return None
 
         # httpx does not follow redirects by default and raise_for_status() ignores 3xx, so a
         # redirect to /login would otherwise sail through as "no servers found".
         if resp.status_code >= 300:
             logger.warning(
-                "GET /servers -> HTTP %s. That page is admin-gated, so the API token's user "
-                "must have the admin role; server names/policy will be unavailable.",
+                "GET /servers -> HTTP %s. That page is admin-gated, so the token's user must "
+                "have the admin role. Upgrading CaddyUI to v2.20.2+ removes the problem — its "
+                "GET /api/v1/servers works with any authenticated token.",
                 resp.status_code,
             )
-            return {}
+            return None
 
         html = resp.text
         markup = _detect_markup(html)
         servers = parse_servers_html(html)
         if not servers:
             logger.warning(
-                "Parsed 0 servers from /servers (markup=%s, %d bytes). If markup=unknown, "
-                "CaddyUI's template changed again — see DECISIONS.md.",
+                "Parsed 0 servers from /servers (markup=%s, %d bytes). Upgrade CaddyUI to "
+                "v2.20.2+ and this page stops being used at all.",
                 markup,
                 len(html),
             )
-        else:
-            logger.debug("Parsed %d servers from /servers (markup=%s)", len(servers), markup)
+            return None
+        logger.debug("Parsed %d servers from /servers (markup=%s)", len(servers), markup)
         return servers
 
     async def discover_servers(self, probe_max: int = 24) -> list[dict[str, Any]]:
         """Discover the Caddy servers CaddyUI manages, with names and proxy-host counts.
 
-        Combines the ``/servers`` page (for id → name/admin_url/status) with a probe of
-        ``GET /api/v1/proxy-hosts`` per id (for host counts + sample domains, since the API is
-        scoped by the ``caddyui_server`` cookie). Reports current servers plus any id that
-        still holds proxy hosts but is no longer a registered server (``orphaned: true`` —
-        leftover rows from a deleted Caddy server).
+        Combines :meth:`registered_servers` (id → name/type/status/…) with a probe of
+        ``GET /api/v1/proxy-hosts`` per id, which is the only way to get per-server host counts
+        and sample domains since that endpoint is scoped by the ``caddyui_server`` cookie.
+
+        Registered servers are always listed. ``probe_max`` bounds the hunt for **orphans** —
+        ids that still hold proxy hosts but are no longer registered servers, i.e. leftovers
+        from a deleted Caddy server (``orphaned: true``). ``orphaned: None`` means the server
+        listing couldn't be determined, so orphan status is unknown.
         """
-        managed = await self.managed_servers()
+        # None (couldn't determine) is deliberately distinct from {} (determined, empty):
+        # without that distinction a failed listing marks every server orphaned, and the tool
+        # instructions tell the model to ignore orphaned entries — confidently wrong output.
+        registered = await self.registered_servers()
+        known = registered or {}
 
         async def count(sid: int) -> tuple[int, list[Any]]:
             try:
@@ -397,31 +339,29 @@ class CaddyUIClient:
                 return 0, []
             return len(hosts), [h.get("domains") for h in hosts[:6] if isinstance(h, dict)]
 
-        ids = sorted(set(managed) | set(range(1, probe_max + 1)))
+        # Registered ids are always included, even beyond probe_max.
+        ids = sorted(set(known) | set(range(1, probe_max + 1)))
         counts = dict(zip(ids, await asyncio.gather(*(count(i) for i in ids)), strict=True))
 
         servers: list[dict[str, Any]] = []
         for sid in ids:
             n, domains = counts[sid]
-            is_managed = sid in managed
-            if not is_managed and n == 0:
+            is_registered = sid in known
+            if not is_registered and n == 0:
                 continue  # neither a registered server nor holding any hosts
-            info = managed.get(sid, {})
+            info = known.get(sid, {})
             # .get() for every key: a partial parse must degrade to nulls, never KeyError.
-            servers.append(
+            entry: dict[str, Any] = {"server_id": sid}
+            entry.update({field: info.get(field) for field in SERVER_FIELDS})
+            entry["tags"] = info.get("tags") or []
+            entry.update(
                 {
-                    "server_id": sid,
-                    "name": info.get("name"),
-                    "admin_url": info.get("admin_url"),
-                    "status": info.get("status"),
-                    "policy": info.get("policy"),
-                    "caddy_version": info.get("caddy_version"),
-                    "last_contact": info.get("last_contact"),
-                    "orphaned": not is_managed,
+                    "orphaned": None if registered is None else not is_registered,
                     "proxy_host_count": n,
                     "sample_domains": domains,
                 }
             )
+            servers.append(entry)
         return servers
 
     # --------------------------------------------------------------- proxy hosts

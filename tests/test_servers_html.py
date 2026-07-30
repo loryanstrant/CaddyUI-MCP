@@ -1,10 +1,9 @@
-"""Offline tests for the ``/servers`` HTML parser, pinned against both markup generations.
+"""Offline tests for the **deprecated** ``/servers`` HTML parser (CaddyUI < 2.20.2 only).
 
-CaddyUI has no JSON endpoint listing its Caddy servers, so ``list_caddy_servers`` scrapes the
-HTML admin page. That page was rewritten once already (v2.20.0's "Caddy Fleet" redesign),
-silently degrading the old ordinal-based parser. These tests pin **both** generations —
-``classic`` (v2.16.9) and ``fleet`` (v2.20.1), each captured verbatim from the live instance —
-so the next redesign is a failing test rather than a silent data-quality regression.
+CaddyUI v2.20.2 added ``GET /api/v1/servers``, so this parser is now only a fallback and is
+scheduled for removal — see ``DECISIONS.md`` (2026-07-31). Until then these tests pin **both**
+markup generations, ``classic`` (v2.16.9) and ``fleet`` (v2.20.1), each captured verbatim from
+the live instance, so the fallback keeps working for anyone still on an older CaddyUI.
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from caddyui_mcp.client import _detect_markup, parse_servers_html
+from caddyui_mcp._servers_html import _detect_markup, parse_servers_html
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -87,19 +86,9 @@ def test_admin_url_extracted(real_page: tuple[str, dict]):
     assert all(e["admin_url"] for e in parsed.values())
 
 
-def test_policy_extracted(real_page: tuple[str, dict]):
+def test_type_extracted(real_page: tuple[str, dict]):
     _, parsed = real_page
-    assert all(e["policy"] == "managed" for e in parsed.values())
-
-
-def test_last_contact_extracted(real_page: tuple[str, dict]):
-    """Taken from the cell before the actions cell — index 5 on classic, 4 on fleet."""
-    _, parsed = real_page
-    for entry in parsed.values():
-        assert entry["last_contact"]
-        # Must not have picked up the actions cell by mistake.
-        assert "Select" not in entry["last_contact"]
-        assert "Delete" not in entry["last_contact"]
+    assert all(e["type"] == "managed" for e in parsed.values())
 
 
 def test_no_duplicate_or_phantom_ids(real_page: tuple[str, dict]):
@@ -109,17 +98,10 @@ def test_no_duplicate_or_phantom_ids(real_page: tuple[str, dict]):
 
 
 def test_both_generations_agree(real_page: tuple[str, dict]):
-    """Same fleet, same answer — only the volatile last_contact may differ."""
-
-    def strip(parsed: dict) -> dict:
-        return {
-            sid: {k: v for k, v in entry.items() if k != "last_contact"}
-            for sid, entry in parsed.items()
-        }
-
+    """Same fleet, same answer — exactly, now that the volatile last_contact field is gone."""
     classic = parse_servers_html(_load(GENERATIONS["classic"]))
     fleet = parse_servers_html(_load(GENERATIONS["fleet"]))
-    assert strip(classic) == strip(fleet)
+    assert classic == fleet
 
 
 # --------------------------------------------------------------------- edge cases (fleet)
@@ -136,19 +118,15 @@ def test_current_badge_and_tags_do_not_bleed_into_name(edge_page: dict):
     assert edge_page[9]["caddy_version"] == "v2.10.0"
 
 
-def test_external_policy_detected(edge_page: dict):
+def test_external_type_detected(edge_page: dict):
     """`external` means writes are stored but never pushed to Caddy — a real safety signal."""
-    assert edge_page[21]["policy"] == "external"
-    assert edge_page[9]["policy"] == "managed"
+    assert edge_page[21]["type"] == "external"
+    assert edge_page[9]["type"] == "managed"
 
 
 def test_offline_and_unknown_status(edge_page: dict):
     assert edge_page[21]["status"] == "offline"
     assert edge_page[22]["status"] == "unknown"
-
-
-def test_never_contacted(edge_page: dict):
-    assert edge_page[21]["last_contact"] == "Never"
 
 
 def test_unix_socket_admin_endpoint(edge_page: dict):
@@ -164,10 +142,10 @@ def test_blank_name_falls_back_to_admin_host(edge_page: dict):
     assert edge_page[23]["name"] == "metroplex"
 
 
-def test_server_named_managed_does_not_poison_policy(edge_page: dict):
-    """Policy is matched outside the name cell, so a server *named* "Managed" is safe."""
+def test_server_named_managed_does_not_poison_type(edge_page: dict):
+    """`type` is matched outside the name cell, so a server *named* "Managed" is safe."""
     assert edge_page[24]["name"] == "Managed"
-    assert edge_page[24]["policy"] == "external"
+    assert edge_page[24]["type"] == "external"
 
 
 def test_mobile_cards_do_not_duplicate_ids(edge_page: dict):

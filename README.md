@@ -49,21 +49,32 @@ references the certificate. `find_unused_certificates` shows what is safe to rem
 CaddyUI can centrally manage **several Caddy instances**, and every resource is scoped to one
 server. Almost every tool takes an optional **`server_id`**; omitting it targets CaddyUI's
 **default server (1)**, which may be empty even when other servers are full. Call
-**`list_caddy_servers`** first — it probes the server ids and reports which hold proxy hosts
-(with sample domains so you can tell them apart) — then pass the chosen `server_id` to the
-other tools. (Server selection uses CaddyUI's `caddyui_server` cookie; there is no documented
-API parameter for it.)
+**`list_caddy_servers`** first — it lists the registered servers and probes ids 1..`probe_max`
+for **orphaned** leftovers from deleted servers, reporting host counts and sample domains so you
+can tell them apart — then pass the chosen `server_id` to the other tools. (Server selection uses
+CaddyUI's `caddyui_server` cookie; there is no documented API parameter for it.)
 
-Each entry also reports **`policy`**, **`caddy_version`** and **`last_contact`**. `policy` is a
-safety signal worth reading: `managed` means CaddyUI validates and **pushes** config to that
-Caddy instance, while `external` means it only *monitors* it — a write there is stored in
+Each entry also reports **`type`**, **`caddy_version`**, **`tags`** and **`last_contact_at`**.
+`type` is a safety signal worth reading: `managed` means CaddyUI validates and **pushes** config
+to that Caddy instance, while `external` means it only *monitors* it — a write there is stored in
 CaddyUI's database and returns success, but never reaches Caddy.
 
-> CaddyUI has no JSON endpoint listing its Caddy servers, so `list_caddy_servers` parses the
-> HTML `/servers` page. That page was redesigned in CaddyUI v2.20 ("Caddy Fleet"), so the parser
-> is deliberately structure-based rather than column-index-based and is pinned by fixtures for
-> both markup generations (`tests/fixtures/`). See `DECISIONS.md` before changing it. The page is
-> admin-gated: a non-admin token still lists resources fine but yields no server names.
+> Server details come from **`GET /api/v1/servers`**, which CaddyUI added in **v2.20.2** at this
+> project's request ([upstream issue #18](https://github.com/X4Applegate/caddyui/issues/18)).
+> It isn't admin-gated, so a `read_only` token now sees full server names — the HTML page it
+> replaced was. On CaddyUI older than 2.20.2 the client falls back to parsing that HTML page;
+> that path is deprecated and scheduled for removal (see `DECISIONS.md`).
+
+## Compatibility
+
+Works against **CaddyUI 2.13+** (when `/api/v1` was introduced), but **2.20.2 or newer** is
+recommended — that's the first release with everything this server uses. On older instances:
+
+| Below | What degrades |
+| --- | --- |
+| **2.20.2** | Server details fall back to scraping the admin-gated HTML page, so `tags` and `last_contact_at` are unavailable and a non-admin token yields no server names. `caddyui_version`'s `latest` field is unreliable ([#17](https://github.com/X4Applegate/caddyui/issues/17)). |
+| **2.17.2** | `managed_certificate_status` returns an error (the endpoint doesn't exist). |
+| **2.17.0** | No `managed` (ACME DNS-01) certificate source; no `dns_provider` / `dns_profile_id` fields. |
 
 ## Configuration
 

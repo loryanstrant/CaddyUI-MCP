@@ -38,17 +38,20 @@ server. Almost every tool takes an optional **`server_id`**:
    server label (e.g. "SHOCKWAVE", "SOUNDWAVE") — plus `admin_url`, `status`, and host count.
 2. **Resolve the server the user named** (e.g. "SHOCKWAVE", "the soundwave box") to its
    `server_id` from that list, then pass **`server_id`** to the other tools. Match names
-   case-insensitively; `admin_url` and `sample_domains` disambiguate if a name is unclear.
+   case-insensitively; `admin_url`, `tags` and `sample_domains` disambiguate if a name is
+   unclear.
 3. If you omit `server_id`, tools target CaddyUI's **default server (1)** — which may be empty
    even when other servers have many hosts. So when a list looks empty, check
    `list_caddy_servers` before concluding there's nothing there.
 4. Entries with `"orphaned": true` are leftover rows from a deleted Caddy server — don't treat
-   them as live servers.
-5. **`policy` tells you whether a write will actually reach Caddy.** `"managed"` = CaddyUI
+   them as live servers. Only `true` means that: `"orphaned": null` means the server list
+   couldn't be read, so those entries may well be real servers.
+5. **`type` tells you whether a write will actually reach Caddy.** `"managed"` = CaddyUI
    validates and **pushes** config to that Caddy instance. `"external"` = CaddyUI **only
    monitors** it — a create/update there is stored in CaddyUI's database and returns success,
    but is **never pushed**, so nothing changes on the wire. Warn the user before writing to an
-   `external` server. Entries also carry `caddy_version` and `last_contact` for that instance.
+   `external` server. Entries also carry `caddy_version`, `tags`, and `last_contact_at`
+   (RFC3339 UTC, or null).
 
 ## Workflow
 1. `list_caddy_servers` → pick a `server_id`.
@@ -121,14 +124,18 @@ async def list_caddy_servers(probe_max: int = 24) -> str:
 
     Use this to resolve a server the user names (e.g. "SHOCKWAVE") to its `server_id`, then pass
     that `server_id` to the other tools. Each entry has: `server_id`, `name` (CaddyUI's own
-    server label, e.g. "SHOCKWAVE"), `admin_url`, `status`, `policy` (`managed` = CaddyUI pushes
-    config there; `external` = monitor-only, writes never reach Caddy), `caddy_version`,
-    `last_contact`, `proxy_host_count`, `sample_domains`, and `orphaned` (true = leftover rows
-    from a deleted server; ignore those). Server labels come from CaddyUI's Servers page; host
-    counts come from probing server ids 1..probe_max.
+    server label, e.g. "SHOCKWAVE"), `admin_url`, `status`, `type` (`managed` = CaddyUI pushes
+    config there; `external` = monitor-only, writes never reach Caddy), `caddy_version`, `tags`,
+    `last_contact_at`, `proxy_host_count`, `sample_domains`, and `orphaned` (true = leftover
+    rows from a deleted server, ignore those; null = the server list couldn't be read).
+
+    Server details come from CaddyUI's `GET /api/v1/servers` (CaddyUI 2.20.2+). Older instances
+    fall back to its HTML Servers page, which is admin-gated and provides no `tags` or
+    `last_contact_at`. Host counts always come from probing.
 
     Args:
-        probe_max: Highest server id to probe for lingering hosts (default 24).
+        probe_max: How deep to scan for **orphaned** leftovers from deleted servers (default
+            24). Registered servers are listed exactly, whatever this is set to.
     """
     try:
         servers = await get_client().discover_servers(probe_max=probe_max)
@@ -594,10 +601,12 @@ async def caddyui_version() -> str:
     """Report CaddyUI's own version: `current`, `latest` available, and `has_update`.
 
     Distinct from `caddy_version`, which reports the version of the *Caddy* instance CaddyUI
-    manages. `current` is reliable and is the field to use — it tells you which API generation
-    you're talking to. Treat `latest` with suspicion: CaddyUI derives it from Docker Hub tags
-    and has been observed reporting an older tag than `current` (e.g. `latest: v2.9.233` on a
-    v2.20.1 install), so don't report "an update is available" on the strength of it alone.
+    manages. `current` is always the field to trust — it tells you which API generation you're
+    talking to.
+
+    `latest` is reliable on **CaddyUI 2.20.2+**. Before that its Docker Hub tag query only read
+    the first page, so it could report a tag *older* than `current` (upstream issue #17). If
+    `latest` sorts below `current`, the instance predates the fix — ignore the field.
     """
     try:
         return _fmt(await get_client().caddyui_version())
