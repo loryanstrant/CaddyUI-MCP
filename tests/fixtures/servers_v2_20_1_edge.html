@@ -1,0 +1,143 @@
+<!--
+  SYNTHETIC fixture — hand-built from CaddyUI v2.20.1 web/templates/servers.html.
+
+  Unlike servers_v2_16_9.html and servers_v2_20_1.html (captured verbatim from the live
+  instance), this one exists to exercise cases the homelab does not currently produce:
+  a "Current" badge, a version pill, tags, an `external` server, a Unix-socket admin
+  endpoint, an HTML-entity name, a blank name, and the empty-state row. It follows the
+  upstream template's element structure exactly; it does not invent markup.
+-->
+<div class="enterprise-page">
+  <section class="fleet-context ui-panel">
+    <div class="fleet-context__message">
+      <span class="ui-status ui-status--automation">Managed</span>
+      <p>CaddyUI validates and pushes configuration.</p>
+    </div>
+    <div class="fleet-context__message">
+      <span class="ui-status ui-status--neutral">External</span>
+      <p>Monitoring and inventory only; configuration is never pushed.</p>
+    </div>
+  </section>
+
+  <div class="hidden md:block ui-table-wrap">
+    <table class="ui-table fleet-table">
+      <thead>
+        <tr>
+          <th>Environment</th><th>Health</th><th>Admin endpoint</th>
+          <th>Policy</th><th>Last contact</th><th class="text-right">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        <!-- Currently-selected server: "Current" badge, version pill, tags, and NO Select form. -->
+        <tr>
+          <td>
+            <div class="fleet-name">
+              <strong>SHOCKWAVE</strong>
+              <span class="ui-status ui-status--info">Current</span>
+            </div>
+            <div class="fleet-tags">
+              <span class="version-pill">v2.10.0</span><span>edge</span><span>prod</span>
+            </div>
+          </td>
+          <td><span class="ui-status ui-status--success">Online</span></td>
+          <td><code class="fleet-endpoint" title="http://shockwave.strant.casa:2019">http://shockwave.strant.casa:2019</code></td>
+          <td><span class="ui-status ui-status--automation">Managed</span></td>
+          <td class="fleet-last-contact">2 minutes ago</td>
+          <td>
+            <div class="fleet-actions">
+              <a href="/servers/9/config" class="ui-button ui-button--quiet">Config</a>
+              <a href="/servers/9/edit" class="ui-button ui-button--quiet">Edit</a>
+              <form method="post" action="/servers/9/delete"><button class="fleet-delete">Delete</button></form>
+            </div>
+          </td>
+        </tr>
+        <!-- External (monitor-only) server, offline, never contacted. -->
+        <tr>
+          <td>
+            <div class="fleet-name"><strong>LEGACY-EDGE</strong></div>
+            <div class="fleet-tags"></div>
+          </td>
+          <td><span class="ui-status ui-status--danger">Offline</span></td>
+          <td><code class="fleet-endpoint" title="http://legacy.example.com:2019">http://legacy.example.com:2019</code></td>
+          <td><span class="ui-status ui-status--neutral">External</span></td>
+          <td class="fleet-last-contact">Never</td>
+          <td>
+            <div class="fleet-actions">
+              <form method="post" action="/servers/21/select"><button class="ui-button ui-button--secondary">Select</button></form>
+              <a href="/servers/21/edit" class="ui-button ui-button--quiet">Edit</a>
+            </div>
+          </td>
+        </tr>
+        <!-- Unix-socket admin endpoint (no scheme, no port) + an HTML-entity name. -->
+        <tr>
+          <td>
+            <div class="fleet-name"><strong>R&amp;D box</strong></div>
+            <div class="fleet-tags"><span class="version-pill">v2.9.1</span></div>
+          </td>
+          <td><span class="ui-status ui-status--neutral">Unknown</span></td>
+          <td><code class="fleet-endpoint" title="unix//run/caddy-admin.sock">unix//run/caddy-admin.sock</code></td>
+          <td><span class="ui-status ui-status--automation">Managed</span></td>
+          <td class="fleet-last-contact">3 days ago</td>
+          <td>
+            <div class="fleet-actions">
+              <form method="post" action="/servers/22/select"><button>Select</button></form>
+              <a href="/servers/22/config">Config</a>
+            </div>
+          </td>
+        </tr>
+        <!-- Blank label: name must fall back to the admin host. -->
+        <tr>
+          <td>
+            <div class="fleet-name"><strong></strong></div>
+            <div class="fleet-tags"></div>
+          </td>
+          <td><span class="ui-status ui-status--success">Online</span></td>
+          <td><code class="fleet-endpoint" title="http://metroplex.strant.casa:2019">http://metroplex.strant.casa:2019</code></td>
+          <td><span class="ui-status ui-status--automation">Managed</span></td>
+          <td class="fleet-last-contact">1 hour ago</td>
+          <td>
+            <div class="fleet-actions">
+              <a href="/servers/23/edit">Edit</a>
+            </div>
+          </td>
+        </tr>
+        <!-- A server literally NAMED "Managed", to prove the policy rule can't be poisoned. -->
+        <tr>
+          <td>
+            <div class="fleet-name"><strong>Managed</strong></div>
+            <div class="fleet-tags"></div>
+          </td>
+          <td><span class="ui-status ui-status--success">Online</span></td>
+          <td><code class="fleet-endpoint" title="http://tricky.strant.casa:2019">http://tricky.strant.casa:2019</code></td>
+          <td><span class="ui-status ui-status--neutral">External</span></td>
+          <td class="fleet-last-contact">5 minutes ago</td>
+          <td>
+            <div class="fleet-actions">
+              <a href="/servers/24/edit">Edit</a>
+            </div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Responsive mobile cards duplicate every server as <article>, NOT <tr>. These must
+       never produce duplicate ids. -->
+  <div class="md:hidden fleet-mobile-list">
+    <article class="ui-panel fleet-mobile-card">
+      <div class="fleet-name"><strong>SHOCKWAVE</strong><span class="ui-status ui-status--info">Current</span></div>
+      <code class="fleet-endpoint">http://shockwave.strant.casa:2019</code>
+      <div class="fleet-actions">
+        <a href="/servers/9/config">Config</a>
+        <a href="/servers/9/edit">Edit</a>
+      </div>
+    </article>
+    <article class="ui-panel fleet-mobile-card">
+      <div class="fleet-name"><strong>LEGACY-EDGE</strong></div>
+      <code class="fleet-endpoint">http://legacy.example.com:2019</code>
+      <div class="fleet-actions">
+        <form method="post" action="/servers/21/select"><button>Select</button></form>
+      </div>
+    </article>
+  </div>
+</div>

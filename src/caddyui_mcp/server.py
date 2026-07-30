@@ -22,6 +22,10 @@ from caddyui_mcp.client import get_client
 
 logger = logging.getLogger(__name__)
 
+#: Valid certificate `source` values. CaddyUI accepts anything and stores it verbatim, so the
+#: wrapper is the only place a typo is catchable.
+_CERT_SOURCES = frozenset({"pem", "path", "managed"})
+
 INSTRUCTIONS = """\
 This server manages a Caddy reverse proxy through the CaddyUI REST API. It exposes four
 resources — **proxy hosts**, **redirection hosts**, **raw routes**, and **TLS
@@ -40,6 +44,11 @@ server. Almost every tool takes an optional **`server_id`**:
    `list_caddy_servers` before concluding there's nothing there.
 4. Entries with `"orphaned": true` are leftover rows from a deleted Caddy server — don't treat
    them as live servers.
+5. **`policy` tells you whether a write will actually reach Caddy.** `"managed"` = CaddyUI
+   validates and **pushes** config to that Caddy instance. `"external"` = CaddyUI **only
+   monitors** it — a create/update there is stored in CaddyUI's database and returns success,
+   but is **never pushed**, so nothing changes on the wire. Warn the user before writing to an
+   `external` server. Entries also carry `caddy_version` and `last_contact` for that instance.
 
 ## Workflow
 1. `list_caddy_servers` → pick a `server_id`.
@@ -54,11 +63,39 @@ server. Almost every tool takes an optional **`server_id`**:
 4. `toggle_*` enables/disables; `set_proxy_host_maintenance` flips maintenance mode.
 5. `delete_*` is **permanent** — confirm the id (and server) with `get_*` first.
 
+## Certificates
+`source` is one of three values, and CaddyUI does **not** validate it on create:
+- **`pem`** — inline material in `cert_pem` + `key_pem`. This is the **silent default** if you
+  omit `source`, so always set it explicitly.
+- **`path`** — `cert_path` + `key_path`, as seen by the Caddy host's filesystem.
+- **`managed`** — ACME **DNS-01**, including standalone wildcards (CaddyUI 2.17+). Needs
+  `dns_provider` (and usually `dns_profile_id`); those credentials must already be saved in
+  CaddyUI's Settings. Caddy obtains and renews these automatically.
+
+Behaviours worth knowing before you act:
+- `list_certificates` returns **`managed` entries mixed in** with hand-supplied ones. CaddyUI's
+  own web dropdowns filter them out; the API does not. Filter on `source` yourself.
+- `update_certificate` is a **partial merge that ignores empty strings** — you cannot blank a
+  field through it. Sending `{"cert_pem": ""}` is a no-op, not a clear. (Unlike the proxy-host
+  tools, where you re-send the whole object.)
+- `delete_certificate` returns **409** if any host or route still references it. Use
+  `find_unused_certificates` to see what's safe to remove.
+- Deleting a **`managed`** certificate **stops ACME renewal** for its domains — that's more than
+  dropping a stored file, so confirm with the user first.
+
+## Before you write
+- `test_upstream` checks a backend is reachable *before* you create a proxy host pointing at it.
+- `validate_raw_route` checks a raw route parses *before* you save it — otherwise errors don't
+  surface until the next sync.
+- `check_deploy_status` after creating tells you whether DNS propagated and the cert was issued.
+
 ## Notes
 - `id`s are integers assigned by CaddyUI. `domains` is a single string (space/comma separated
   for multiple hostnames).
 - Mutations need a token with `full` scope (or `proxy_write` for proxy hosts only). A
-  read-only token returns an error containing "token scope is read-only".
+  read-only token returns an error containing "token scope is read-only". `test_upstream` and
+  `validate_raw_route` change nothing, but are POSTs, so a read-only token is refused for them
+  too.
 """
 
 mcp = FastMCP(name="CaddyUI", instructions=INSTRUCTIONS)
@@ -84,9 +121,11 @@ async def list_caddy_servers(probe_max: int = 24) -> str:
 
     Use this to resolve a server the user names (e.g. "SHOCKWAVE") to its `server_id`, then pass
     that `server_id` to the other tools. Each entry has: `server_id`, `name` (CaddyUI's own
-    server label, e.g. "SHOCKWAVE"), `admin_url`, `status`, `proxy_host_count`, `sample_domains`,
-    and `orphaned` (true = leftover rows from a deleted server; ignore those). Server labels come
-    from CaddyUI's Servers page; host counts come from probing server ids 1..probe_max.
+    server label, e.g. "SHOCKWAVE"), `admin_url`, `status`, `policy` (`managed` = CaddyUI pushes
+    config there; `external` = monitor-only, writes never reach Caddy), `caddy_version`,
+    `last_contact`, `proxy_host_count`, `sample_domains`, and `orphaned` (true = leftover rows
+    from a deleted server; ignore those). Server labels come from CaddyUI's Servers page; host
+    counts come from probing server ids 1..probe_max.
 
     Args:
         probe_max: Highest server id to probe for lingering hosts (default 24).
@@ -397,7 +436,10 @@ async def toggle_raw_route(route_id: int, server_id: int | None = None) -> str:
 
 @mcp.tool(annotations=_READ)
 async def list_certificates(server_id: int | None = None) -> str:
-    """List all TLS certificates managed by CaddyUI for a server.
+    """List all TLS certificates CaddyUI holds for a server.
+
+    Includes `source: "managed"` (ACME/DNS-01) entries mixed in with hand-supplied `pem`/`path`
+    ones — CaddyUI's web dropdowns hide those, but the API does not. Filter on `source`.
 
     Args:
         server_id: Which managed Caddy server to target (default: server 1).
@@ -427,9 +469,29 @@ async def create_certificate(config: dict[str, Any], server_id: int | None = Non
     """Create/register a new certificate. `get_certificate` on an existing one to learn the shape.
 
     Args:
-        config: The certificate as a JSON object.
+        config: The certificate as a JSON object. `name` is required. Set `source` explicitly —
+            CaddyUI silently defaults it to `"pem"`. Then supply the matching fields:
+            `pem` → `cert_pem` + `key_pem`; `path` → `cert_path` + `key_path`;
+            `managed` → `dns_provider` (+ usually `dns_profile_id`) for ACME DNS-01.
         server_id: Which managed Caddy server to create it on (default: server 1).
     """
+    # CaddyUI validates neither of these and writes the row regardless, so a typo here lands an
+    # unusable certificate in its database. Guard only where the fallback is unusable — the
+    # omitted-`source` default of "pem" is documented and legitimate, so it is left alone.
+    source = config.get("source")
+    if source is not None and source not in _CERT_SOURCES:
+        return (
+            f"Error: source {source!r} is not valid. Use one of: "
+            f"{', '.join(sorted(_CERT_SOURCES))}. CaddyUI does not validate this field and "
+            "would store the certificate in an unusable state."
+        )
+    if source == "managed" and not str(config.get("dns_provider") or "").strip():
+        return (
+            "Error: a 'managed' certificate is issued via ACME DNS-01 and needs 'dns_provider' "
+            "(and usually 'dns_profile_id'). Those credentials must already be saved in "
+            "CaddyUI's Settings. Run get_certificate on an existing managed certificate to copy "
+            "the values."
+        )
     try:
         return _fmt(await get_client().create_certificate(config, server_id=server_id))
     except Exception as e:
@@ -440,11 +502,14 @@ async def create_certificate(config: dict[str, Any], server_id: int | None = Non
 async def update_certificate(
     cert_id: int, config: dict[str, Any], server_id: int | None = None
 ) -> str:
-    """Update an existing certificate.
+    """Update an existing certificate (a partial merge — send only the fields you're changing).
+
+    CaddyUI **ignores empty strings**, so you cannot blank a field this way: `{"cert_pem": ""}`
+    is a no-op, not a clear. Delete and recreate the certificate if you need a field emptied.
 
     Args:
         cert_id: The integer id of the certificate to update.
-        config: The updated certificate as a JSON object.
+        config: The fields to change, as a JSON object.
         server_id: Which managed Caddy server the certificate is on (default: server 1).
     """
     try:
@@ -456,6 +521,11 @@ async def update_certificate(
 @mcp.tool(annotations=_DESTRUCTIVE)
 async def delete_certificate(cert_id: int, server_id: int | None = None) -> str:
     """Permanently delete a certificate by id.
+
+    Returns a 409 error if any proxy host, redirection host or raw route still references it —
+    clear the reference first (`find_unused_certificates` shows what's safe to remove). Deleting
+    a `source: "managed"` certificate also **stops ACME renewal** for its domains, so confirm
+    with the user before doing that.
 
     Args:
         cert_id: The integer id of the certificate to delete.
@@ -517,3 +587,135 @@ async def search(query: str) -> str:
         return _fmt(await get_client().search(query))
     except Exception as e:
         return f"Error searching for {query!r}: {e}"
+
+
+@mcp.tool(annotations=_READ)
+async def caddyui_version() -> str:
+    """Report CaddyUI's own version: `current`, `latest` available, and `has_update`.
+
+    Distinct from `caddy_version`, which reports the version of the *Caddy* instance CaddyUI
+    manages. `current` is reliable and is the field to use — it tells you which API generation
+    you're talking to. Treat `latest` with suspicion: CaddyUI derives it from Docker Hub tags
+    and has been observed reporting an older tag than `current` (e.g. `latest: v2.9.233` on a
+    v2.20.1 install), so don't report "an update is available" on the strength of it alone.
+    """
+    try:
+        return _fmt(await get_client().caddyui_version())
+    except Exception as e:
+        return f"Error getting CaddyUI version: {e}"
+
+
+# ================================================================= pre-flight / diagnostics
+
+
+@mcp.tool(annotations=_READ)
+async def test_upstream(
+    host: str, port: int, scheme: str = "http", server_id: int | None = None
+) -> str:
+    """Check whether a backend is reachable, **before** creating a proxy host pointing at it.
+
+    Changes nothing, but it is a POST, so a `read_only`-scoped token is refused.
+
+    Args:
+        host: Backend hostname or IP (e.g. "10.0.0.5").
+        port: Backend port (e.g. 3000).
+        scheme: "http" (default) or "https".
+        server_id: Which managed Caddy server to test from (default: server 1).
+    """
+    try:
+        return _fmt(
+            await get_client().test_upstream(host, port, scheme=scheme, server_id=server_id)
+        )
+    except Exception as e:
+        return f"Error testing upstream {host}:{port}: {e}"
+
+
+@mcp.tool(annotations=_READ)
+async def validate_raw_route(
+    caddyfile_src: str | None = None,
+    json_data: str | None = None,
+    server_id: int | None = None,
+) -> str:
+    """Validate a raw route **before** saving it. Returns `{"ok": bool, "error": str}`.
+
+    Worth doing every time: a malformed raw route otherwise fails silently at save time and only
+    surfaces at the next Caddy sync. Changes nothing, but it is a POST, so a `read_only` token
+    is refused.
+
+    Args:
+        caddyfile_src: Caddyfile snippet to check (parsed through Caddy's config adapter).
+        json_data: Route JSON to check instead — must contain a non-empty `handle` array.
+        server_id: Which managed Caddy server to validate against (default: server 1).
+    """
+    if not caddyfile_src and not json_data:
+        return "Error: pass either caddyfile_src or json_data."
+    try:
+        return _fmt(
+            await get_client().validate_raw_route(
+                caddyfile_src=caddyfile_src, json_data=json_data, server_id=server_id
+            )
+        )
+    except Exception as e:
+        return f"Error validating raw route: {e}"
+
+
+@mcp.tool(annotations=_READ)
+async def check_deploy_status(resource: str, resource_id: int, server_id: int | None = None) -> str:
+    """Check post-save deployment of a proxy host or raw route (DNS propagated? cert issued?).
+
+    Use this after `create_proxy_host` / `create_raw_route` to confirm the change actually
+    landed, rather than trusting the create response alone.
+
+    Args:
+        resource: Either "proxy_host" or "raw_route".
+        resource_id: The integer id of that proxy host or raw route.
+        server_id: Which managed Caddy server it lives on (default: server 1).
+    """
+    client = get_client()
+    lookup = {
+        "proxy_host": client.proxy_host_deploy_status,
+        "raw_route": client.raw_route_deploy_status,
+    }
+    fetch = lookup.get(resource)
+    if fetch is None:
+        return f"Error: resource must be 'proxy_host' or 'raw_route', not {resource!r}."
+    try:
+        return _fmt(await fetch(resource_id, server_id=server_id))
+    except Exception as e:
+        return f"Error getting deploy status for {resource} {resource_id}: {e}"
+
+
+@mcp.tool(annotations=_READ)
+async def managed_certificate_status(cert_id: int, server_id: int | None = None) -> str:
+    """Live ACME status of a `managed` certificate on **every** Caddy server CaddyUI knows.
+
+    Per server: whether the definition is deployed there, the certificate actually being served,
+    its issuer, expiry, days remaining, and any renewal problem. Only valid for certificates
+    whose `source` is `"managed"` — others return an error. Needs CaddyUI 2.17.2+.
+
+    Args:
+        cert_id: The integer id of the managed certificate.
+        server_id: Which managed Caddy server to ask (default: server 1).
+    """
+    try:
+        return _fmt(await get_client().managed_certificate_status(cert_id, server_id=server_id))
+    except Exception as e:
+        return f"Error getting managed certificate status for {cert_id}: {e}"
+
+
+@mcp.tool(annotations=_READ)
+async def find_unused_certificates(server_id: int | None = None) -> str:
+    """List certificates on a server that no proxy host, redirection host or raw route uses.
+
+    These are candidates for cleanup — `delete_certificate` refuses (409) while a certificate is
+    still referenced, so everything listed here is safe to remove. `managed` (ACME) certificates
+    are excluded: Caddy attaches those by domain coverage rather than by id, so they are never
+    "unused" in this sense.
+
+    Args:
+        server_id: Which managed Caddy server to check (default: server 1).
+    """
+    try:
+        return _fmt(await get_client().unused_certificates(server_id=server_id))
+    except Exception as e:
+        return f"Error finding unused certificates: {e}"

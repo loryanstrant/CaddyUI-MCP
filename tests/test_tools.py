@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from caddyui_mcp.client import SERVER_COOKIE, CaddyUIClient, CaddyUIError, CaddyUISettings
-from caddyui_mcp.server import _fmt
+from caddyui_mcp.client import (
+    SERVER_COOKIE,
+    CaddyUIClient,
+    CaddyUIError,
+    CaddyUISettings,
+    select_unused_certificates,
+)
+from caddyui_mcp.server import _fmt, create_certificate, validate_raw_route
 
 # --------------------------------------------------------------------------- unit
 
@@ -53,6 +61,113 @@ def test_server_cookie_name():
     assert SERVER_COOKIE == "caddyui_server"
 
 
+def test_json_and_data_are_mutually_exclusive():
+    """/api/v1 takes JSON; the unversioned /api/* AJAX helpers take form values. Never both."""
+    c = CaddyUIClient(CaddyUISettings(caddyui_url="https://x", caddyui_token="t"))
+    with pytest.raises(ValueError, match="not both"):
+        asyncio.run(c._request("POST", "/x", json={"a": 1}, data={"b": "2"}))
+
+
+# ------------------------------------------------- unused certificates (pure logic)
+#
+# Mirrors CaddyUI's own internal/server/certificate_usage.go, which has no API endpoint.
+
+_CERTS = [
+    {"id": 1, "name": "wildcard-pem", "source": "pem"},
+    {"id": 2, "name": "on-disk", "source": "path"},
+    {"id": 3, "name": "acme-wildcard", "source": "managed"},
+    {"id": 4, "name": "spare", "source": "pem"},
+]
+
+
+def _unused_names(**kwargs) -> list[str]:
+    result = select_unused_certificates(
+        _CERTS,
+        kwargs.get("proxy_hosts", []),
+        kwargs.get("redirection_hosts", []),
+        kwargs.get("raw_routes", []),
+    )
+    return [c["name"] for c in result["unused"]]
+
+
+def test_unreferenced_custom_certificates_are_unused():
+    assert _unused_names() == ["wildcard-pem", "on-disk", "spare"]
+
+
+def test_managed_certificates_are_never_unused():
+    """Caddy attaches ACME certs by domain coverage, not by certificate_id."""
+    assert "acme-wildcard" not in _unused_names()
+
+
+def test_reference_from_any_resource_type_counts():
+    assert "wildcard-pem" not in _unused_names(proxy_hosts=[{"certificate_id": 1}])
+    assert "on-disk" not in _unused_names(redirection_hosts=[{"certificate_id": 2}])
+    assert "spare" not in _unused_names(raw_routes=[{"certificate_id": 4}])
+
+
+def test_certificate_id_zero_means_no_certificate():
+    """0 is CaddyUI's 'none', not a reference to certificate id 0."""
+    result = select_unused_certificates(_CERTS, [{"certificate_id": 0}], [], [])
+    assert result["referenced_ids"] == []
+    assert len(result["unused"]) == 3
+
+
+def test_non_list_input_degrades_instead_of_raising():
+    """A failed upstream call must not turn into a traceback."""
+    result = select_unused_certificates(_CERTS, None, "error string", [])
+    assert result["certificates_checked"] == 4
+    assert result["referenced_ids"] == []
+
+
+# ---------------------------------------------------- tool-layer guards (no network)
+
+
+@pytest.fixture
+def no_client(monkeypatch: pytest.MonkeyPatch):
+    """Make any attempt to reach CaddyUI an error, so guards must reject before calling."""
+
+    def boom():
+        raise AssertionError("guard should have rejected before touching the client")
+
+    monkeypatch.setattr("caddyui_mcp.server.get_client", boom)
+
+
+@pytest.mark.asyncio
+async def test_create_certificate_rejects_unknown_source(no_client):
+    out = await create_certificate({"name": "x", "source": "pfx"})
+    assert "not valid" in out
+    assert "managed" in out and "pem" in out and "path" in out
+
+
+@pytest.mark.asyncio
+async def test_create_certificate_rejects_managed_without_dns_provider(no_client):
+    out = await create_certificate({"name": "x", "source": "managed"})
+    assert "dns_provider" in out
+
+
+@pytest.mark.asyncio
+async def test_create_certificate_allows_managed_with_dns_provider(monkeypatch):
+    """The guard must not block a valid managed cert."""
+    seen: dict = {}
+
+    class _Stub:
+        async def create_certificate(self, config, server_id=None):
+            seen.update(config)
+            return {"id": 7, **config}
+
+    monkeypatch.setattr("caddyui_mcp.server.get_client", lambda: _Stub())
+    out = await create_certificate(
+        {"name": "wild", "source": "managed", "dns_provider": "cloudflare"}
+    )
+    assert seen["dns_provider"] == "cloudflare"
+    assert '"id": 7' in out
+
+
+@pytest.mark.asyncio
+async def test_validate_raw_route_requires_an_argument(no_client):
+    assert "either" in await validate_raw_route()
+
+
 # ---------------------------------------------------------------------------- live
 
 
@@ -68,8 +183,121 @@ async def test_live_discover_servers(live_settings: tuple[str, str]):
         for s in servers:
             assert isinstance(s["server_id"], int)
             assert s["proxy_host_count"] >= 1
+            # New keys must always be present, even if a partial parse leaves them null.
+            for key in ("policy", "caddy_version", "last_contact"):
+                assert key in s
         # This deployment has hosts spread across several servers.
         assert servers, "expected at least one server with proxy hosts"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.live
+async def test_live_servers_page_parses(live_settings: tuple[str, str]):
+    """The regression guard: scraped names must stay clean whatever CaddyUI's template does.
+
+    This is markup-generation agnostic on purpose — it would have caught the v2.20 "Caddy
+    Fleet" rewrite gluing badges onto the name, and it passes on both v2.16 and v2.20.
+    """
+    url, token = live_settings
+    client = CaddyUIClient(CaddyUISettings(caddyui_url=url, caddyui_token=token))
+    try:
+        servers = await client.managed_servers()
+        assert servers, "expected at least one registered Caddy server"
+        for sid, s in servers.items():
+            assert isinstance(sid, int)
+            name = s["name"]
+            assert name, f"server {sid} has no name"
+            assert "\n" not in name, f"server {sid} name has bled: {name!r}"
+            assert "Current" not in name, f"server {sid} name absorbed a badge: {name!r}"
+            assert len(name) <= 64, f"server {sid} name looks like a whole cell: {name!r}"
+            assert s["status"] in {"online", "offline", "unknown", "error", None}
+            assert s["policy"] in {"managed", "external", None}
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.live
+async def test_live_caddyui_version(live_settings: tuple[str, str]):
+    url, token = live_settings
+    client = CaddyUIClient(CaddyUISettings(caddyui_url=url, caddyui_token=token))
+    try:
+        v = await client.caddyui_version()
+        assert {"current", "latest", "has_update"} <= set(v)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.live
+async def test_live_certificate_shape(live_settings: tuple[str, str]):
+    """`source` is one of three values; the DNS fields exist only on CaddyUI 2.17+.
+
+    Version-gated so the suite is green on an older instance and tightens automatically once
+    it is upgraded, rather than needing an edit at upgrade time.
+    """
+    url, token = live_settings
+    client = CaddyUIClient(CaddyUISettings(caddyui_url=url, caddyui_token=token))
+    try:
+        current = (await client.caddyui_version()).get("current", "")
+        parts = current.lstrip("v").split(".")
+        has_dns_fields = (int(parts[0]), int(parts[1])) >= (2, 17)
+
+        certs = await client.list_certificates()
+        assert isinstance(certs, list)
+        for c in certs:
+            assert c["source"] in {"pem", "path", "managed"}
+            if has_dns_fields:
+                assert "dns_provider" in c
+                assert "dns_profile_id" in c
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.live
+async def test_live_validate_raw_route(live_settings: tuple[str, str]):
+    """Non-mutating: validation only. Proves the form-encoded transport reaches r.FormValue."""
+    url, token = live_settings
+    client = CaddyUIClient(CaddyUISettings(caddyui_url=url, caddyui_token=token))
+    try:
+        bad = await client.validate_raw_route(json_data='{"nope": 1}')
+        assert bad["ok"] is False
+
+        good = await client.validate_raw_route(
+            json_data='[{"handle":[{"handler":"static_response","body":"hi"}]}]'
+        )
+        assert good["ok"] is True, good
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.live
+async def test_live_test_upstream_unreachable(live_settings: tuple[str, str]):
+    """Port 9 is the discard port — reliably closed, so this is self-contained."""
+    url, token = live_settings
+    client = CaddyUIClient(CaddyUISettings(caddyui_url=url, caddyui_token=token))
+    try:
+        result = await client.test_upstream("127.0.0.1", 9)
+        assert result["ok"] is False
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.live
+async def test_live_find_unused_certificates(live_settings: tuple[str, str]):
+    url, token = live_settings
+    client = CaddyUIClient(CaddyUISettings(caddyui_url=url, caddyui_token=token))
+    try:
+        result = await client.unused_certificates()
+        assert isinstance(result["unused"], list)
+        assert isinstance(result["certificates_checked"], int)
+        # Managed (ACME) certificates must never be reported as unused.
+        assert all(c["source"] in {"pem", "path"} for c in result["unused"])
     finally:
         await client.close()
 

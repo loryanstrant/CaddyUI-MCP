@@ -1,0 +1,28 @@
+<!--
+  SYNTHETIC fixture — CaddyUI v2.20.1 `/servers` with no servers registered.
+  The empty state is a single <tr> with a colspan cell and no /servers/{id}/ link,
+  so it must parse to {} rather than producing a phantom entry.
+-->
+<div class="enterprise-page">
+  <div class="hidden md:block ui-table-wrap">
+    <table class="ui-table fleet-table">
+      <thead>
+        <tr>
+          <th>Environment</th><th>Health</th><th>Admin endpoint</th>
+          <th>Policy</th><th>Last contact</th><th class="text-right">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td colspan="6">
+            <div class="ui-empty">
+              <div class="ui-empty__title">No Caddy environments registered</div>
+              <div class="ui-empty__body">Add a managed or external Caddy server to begin.</div>
+              <a href="/servers/new" class="ui-button ui-button--primary mt-4">Add Caddy server</a>
+            </div>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
